@@ -298,11 +298,12 @@ export interface ChannelAdapter {
   subscribe?(platformId: string, threadId: string): Promise<void>;
 
   /**
-   * Read a thread's newest `limit` lines from the platform, oldest first.
-   * Rejects a threadId that does not belong to platformId. Adapters whose
-   * platform has no way to read earlier messages omit this.
+   * Read the newest `limit` lines of a thread, or of the chat's top level when
+   * threadId is null, oldest first. Rejects a threadId that does not belong to
+   * platformId. Adapters whose platform has no way to read earlier messages
+   * omit this.
    */
-  readHistory?(platformId: string, threadId: string, options: { limit: number }): Promise<HistoryLine[]>;
+  readHistory?(platformId: string, threadId: string | null, options: { limit: number }): Promise<HistoryLine[]>;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

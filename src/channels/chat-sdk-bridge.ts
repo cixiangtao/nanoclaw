@@ -1337,13 +1337,20 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       await state.subscribe(threadId);
     },
 
-    async readHistory(platformId: string, threadId: string, { limit }: { limit: number }): Promise<HistoryLine[]> {
-      if (adapter.channelIdFromThreadId(threadId) !== platformId) {
+    async readHistory(
+      platformId: string,
+      threadId: string | null,
+      { limit }: { limit: number },
+    ): Promise<HistoryLine[]> {
+      if (threadId !== null && adapter.channelIdFromThreadId(threadId) !== platformId) {
         throw new Error('History read refused: thread is not in this chat');
       }
-      // history.thread.list reads the platform, or the SDK's own cache on
-      // platforms without server-side history.
-      const { messages } = await chat.history.thread.list(threadId, { limit });
+      // The library reads the platform, or its own cache on platforms without
+      // server-side history.
+      const { messages } =
+        threadId === null
+          ? await chat.history.channel.listMessages(platformId, { limit })
+          : await chat.history.thread.list(threadId, { limit });
       return messages.map((m) => ({
         id: m.id,
         timestamp: m.metadata.dateSent.toISOString(),

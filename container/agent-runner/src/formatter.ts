@@ -285,8 +285,10 @@ function formatSingleChat(msg: MessageInRow): string {
  */
 function formatEchoMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
-  // Earlier lines of this thread, read back from the chat by the host: one row, many lines.
-  if (content.echo?.surface === 'thread-history' && Array.isArray(content.lines)) {
+  // Lines read back from the chat by the host, one row for many lines: this
+  // thread's earlier talk, or other recent talk at the chat's top level.
+  const block = content.echo?.surface;
+  if ((block === 'thread-history' || block === 'channel-context') && Array.isArray(content.lines)) {
     const lines = content.lines.map((line: { sender?: string; time?: string; text?: string; self?: boolean }) => {
       const sender = line.self ? 'you' : line.sender || 'Unknown';
       const time = formatLocalStamp(new Date(line.time ?? msg.timestamp), TIMEZONE);
@@ -296,7 +298,7 @@ function formatEchoMessage(msg: MessageInRow): string {
     if (withheld > 0) {
       lines.push(`${withheld} earlier ${withheld === 1 ? 'line' : 'lines'} from senders not admitted in this chat left out.`);
     }
-    return `<thread-history>\n${lines.join('\n')}\n</thread-history>`;
+    return `<${block}>\n${lines.join('\n')}\n</${block}>`;
   }
   const label = content.echo?.label || 'another conversation';
   // `self` marks the agent's own post; the host sets it in backfill and the outbound fan.

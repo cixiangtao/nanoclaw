@@ -70,3 +70,7 @@ export const THREAD_HISTORY_LIMIT = 100;
 
 /** Longest a platform history read may hold up the message that woke the agent. */
 export const PLATFORM_HISTORY_BUDGET_MS = 1500;
+
+/** Platform history: other recent top-level talk in the chat, read back from
+ *  the chat for a new or long-idle session. Rendered as <channel-context>. */
+export const CHANNEL_CONTEXT_SURFACE = 'channel-context';

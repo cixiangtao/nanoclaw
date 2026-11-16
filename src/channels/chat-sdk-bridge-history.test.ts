@@ -48,12 +48,16 @@ function message(
   };
 }
 
-async function bridgeOver(fetchMessages: (threadId: string, options: unknown) => Promise<unknown>) {
+async function bridgeOver(
+  fetchMessages: (threadId: string, options: unknown) => Promise<unknown>,
+  fetchChannelMessages?: (channelId: string, options: unknown) => Promise<unknown>,
+) {
   const adapter = {
     name: 'testchat',
     initialize: async () => {},
     channelIdFromThreadId: (threadId: string) => threadId.split(':').slice(0, 2).join(':'),
     fetchMessages,
+    fetchChannelMessages,
   } as unknown as Adapter;
   const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
   await bridge.setup(hostConfig);
@@ -93,6 +97,20 @@ describe('chat-sdk bridge readHistory', () => {
         isSelf: true,
       },
     ]);
+  });
+
+  it("reads the chat's top-level lines when no thread is named", async () => {
+    const fetchMessages = vi.fn(async () => ({ messages: [] }));
+    const fetchChannelMessages = vi.fn(async () => ({
+      messages: [message('m3', 'standup in 5', { userId: 'U2', fullName: 'Dana', isBot: false, isMe: false })],
+    }));
+    const bridge = await bridgeOver(fetchMessages, fetchChannelMessages);
+
+    const lines = await bridge.readHistory!('testchat:C1', null, { limit: 14 });
+
+    expect(fetchChannelMessages).toHaveBeenCalledWith('testchat:C1', { limit: 14 });
+    expect(fetchMessages).not.toHaveBeenCalled();
+    expect(lines.map((line) => line.text)).toEqual(['standup in 5']);
   });
 
   it('refuses a thread that belongs to another chat, without reading it', async () => {

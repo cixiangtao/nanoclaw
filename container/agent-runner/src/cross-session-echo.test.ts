@@ -190,6 +190,24 @@ describe('formatter rendering', () => {
     );
   });
 
+  it('renders a channel-context row as ONE <channel-context> block', () => {
+    insertMessage(
+      'cc-1',
+      'chat',
+      {
+        text: 'Other recent talk in this chat (1 lines, 0 left out)',
+        lines: [{ sender: 'Lee', time: '2026-11-01T09:00:00.000Z', text: 'standup moved' }],
+        withheld: 0,
+        echo: { surface: 'channel-context', label: 'this chat' },
+      },
+      { trigger: 0, channelType: 'session-echo' },
+    );
+
+    const result = formatMessages(getPendingMessages());
+    expect(result).toMatch(/^<channel-context>\n<line sender="Lee" time="[^"]+">standup moved<\/line>\n<\/channel-context>$/m);
+    expect(result).not.toContain('<message');
+  });
+
   it('XML-escapes label, sender, and text', () => {
     insertEcho('e1', { text: '<b>&"hi"</b>', sender: 'A & B', label: 'DM with <Gavriel>' });
 

@@ -48,9 +48,15 @@ interface BackfillRow {
   platformMessageId?: string;
 }
 
-function parseContent(raw: string): { text?: string; sender?: string; senderId?: string; echo?: unknown } {
+function parseContent(raw: string): {
+  id?: unknown;
+  text?: string;
+  sender?: string;
+  senderId?: string;
+  echo?: unknown;
+} {
   try {
-    return JSON.parse(raw) as { text?: string; sender?: string; senderId?: string; echo?: unknown };
+    return JSON.parse(raw) as { id?: unknown; text?: string; sender?: string; senderId?: string; echo?: unknown };
   } catch {
     return {};
   }
@@ -92,6 +98,8 @@ async function collectSiblingTopLevel(
         senderId: c.senderId ?? '',
         text: c.text,
         self: false,
+        // A held message carries the platform's id as `id` (the chat library's serialized message).
+        platformMessageId: typeof c.id === 'string' ? c.id : undefined,
       });
     }
   }

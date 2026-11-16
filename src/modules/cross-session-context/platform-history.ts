@@ -7,7 +7,9 @@
  * NANOCLAW_PLATFORM_HISTORY and its adapter can read history, those lines are
  * read back from the platform and written as ONE context-only row before the
  * trigger (a prompt takes a bounded number of rows, so a block of many lines
- * must be one row).
+ * must be one row). A new or long-idle session also gets the chat's other
+ * recent top-level lines the same way, as one more row: they join what the
+ * backfill seeded from the session's siblings, each message once.
  *
  * Only lines the session has not seen, matched exactly by the platform's
  * message id: not a message it holds, not a line an earlier block showed, not
@@ -26,13 +28,16 @@ import { log } from '../../log.js';
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from '../../types.js';
 import { wouldAdmitSender } from '../permissions/access.js';
+import { BACKFILL_LIMIT } from './backfill.js';
 import {
+  CHANNEL_CONTEXT_SURFACE,
   ECHO_CHANNEL_TYPE,
+  ECHO_MAX_AGE_MS,
   PLATFORM_HISTORY_BUDGET_MS,
   THREAD_HISTORY_LIMIT,
   THREAD_HISTORY_SURFACE,
 } from './config.js';
-import { truncateEchoText } from './fan.js';
+import { loadHotCandidates, selectHotSessions, truncateEchoText } from './fan.js';
 
 /**
  * Newest session rows searched for what the session already has. The newest
@@ -100,8 +105,8 @@ interface BlockContent {
 }
 
 /**
- * Platform ids the session already has, and whether this trigger already has
- * its block. Held messages carry the platform id as `id` (the chat library's
+ * Platform ids the session already has, and which blocks this trigger already
+ * has. Held messages carry the platform id as `id` (the chat library's
  * serialized message); seeded rows and delivered replies carry it as
  * `platformMessageId`.
  */
@@ -111,7 +116,7 @@ async function readSeen(agentGroupId: string, sessionId: string, triggerId: stri
     outbound: mailbox.getOutboundHistory(OWN_ROWS_SCAN),
   }));
   const seen = new Set<string>();
-  let hasBlock = false;
+  const written = new Set<string>();
   for (const row of rows?.outbound ?? []) {
     if (row.platformMessageId) seen.add(row.platformMessageId);
   }
@@ -123,8 +128,9 @@ async function readSeen(agentGroupId: string, sessionId: string, triggerId: stri
     } catch {
       continue;
     }
-    if (content.echo?.surface === THREAD_HISTORY_SURFACE) {
-      if (content.triggerId === triggerId) hasBlock = true;
+    const surface = content.echo?.surface;
+    if (surface === THREAD_HISTORY_SURFACE || surface === CHANNEL_CONTEXT_SURFACE) {
+      if (content.triggerId === triggerId) written.add(surface);
       for (const line of content.lines ?? []) if (typeof line.id === 'string') seen.add(line.id);
       for (const id of content.withheldIds ?? []) if (typeof id === 'string') seen.add(id);
     } else if (typeof content.platformMessageId === 'string') {
@@ -133,7 +139,7 @@ async function readSeen(agentGroupId: string, sessionId: string, triggerId: stri
       seen.add(content.id);
     }
   }
-  return { seen, hasBlock };
+  return { seen, written };
 }
 
 interface Look {
@@ -145,13 +151,21 @@ interface Look {
 
 const NOTHING: Look = { kept: [], withheld: [] };
 
-/** The unseen lines before the trigger, split by whether the sender is admitted. */
+interface Looks {
+  thread: Look;
+  channel: Look;
+}
+
+const NO_LOOKS: Looks = { thread: NOTHING, channel: NOTHING };
+
+/** The newest `limit` unseen lines before the trigger, split by whether the sender is admitted. */
 async function unseenLines(
   lines: HistoryLine[],
   seen: Set<string>,
   trigger: PlatformHistoryOptions['trigger'],
   mg: MessagingGroup,
   wiring: MessagingGroupAgent,
+  limit: number,
 ): Promise<Look> {
   const triggerAt = Date.parse(trigger.timestamp);
   const unseen = lines.filter(
@@ -171,15 +185,22 @@ async function unseenLines(
   };
   const verdicts = await Promise.all(unseen.map(admits));
   return {
-    kept: unseen.filter((_, i) => verdicts[i]).slice(-THREAD_HISTORY_LIMIT),
+    kept: unseen.filter((_, i) => verdicts[i]).slice(-limit),
     withheld: unseen.filter((_, i) => !verdicts[i]),
   };
 }
 
-function blockContent({ kept, withheld }: Look, triggerId: string): string {
+const BLOCKS = {
+  [CHANNEL_CONTEXT_SURFACE]: { label: 'this chat', summary: 'Other recent talk in this chat' },
+  [THREAD_HISTORY_SURFACE]: { label: 'this thread', summary: 'Earlier talk in this thread' },
+} as const;
+
+type BlockSurface = keyof typeof BLOCKS;
+
+function blockContent({ kept, withheld }: Look, triggerId: string, surface: BlockSurface): string {
   const last = kept.length - 1;
   return JSON.stringify({
-    text: `Earlier talk in this thread (${kept.length} lines, ${withheld.length} left out)`,
+    text: `${BLOCKS[surface].summary} (${kept.length} lines, ${withheld.length} left out)`,
     triggerId,
     withheld: withheld.length,
     withheldIds: withheld.map((line) => line.id),
@@ -191,34 +212,55 @@ function blockContent({ kept, withheld }: Look, triggerId: string): string {
       text: i === 0 || i === last ? line.text.slice(0, 4000) : truncateEchoText(line.text),
       ...(line.isSelf ? { self: true } : {}),
     })),
-    echo: { surface: THREAD_HISTORY_SURFACE, label: 'this thread' },
+    echo: { surface, label: BLOCKS[surface].label },
   });
 }
 
-async function writeBlock(
+/** Writes the channel block, then the thread block: the message's context, then the talk it answers. */
+async function writeBlocks(
   agentGroupId: string,
   sessionId: string,
   trigger: PlatformHistoryOptions['trigger'],
-  look: Look,
+  looks: Looks,
 ): Promise<void> {
-  if (look.kept.length === 0 && look.withheld.length === 0) return;
-  await withMailboxSession(agentGroupId, sessionId, (mailbox) =>
-    mailbox.insertMessage({
-      id: `${sessionId}:thread-history:${trigger.id}`,
-      kind: 'chat',
-      timestamp: trigger.timestamp,
-      platformId: null,
-      channelType: ECHO_CHANNEL_TYPE,
-      threadId: null,
-      content: blockContent(look, trigger.id),
-      processAfter: null,
-      recurrence: null,
-      trigger: false,
-      sourceSessionId: null,
-      onWake: false,
-    }),
-  );
-  log.debug('Wrote platform thread history', { sessionId, lines: look.kept.length, withheld: look.withheld.length });
+  const blocks = (
+    [
+      [CHANNEL_CONTEXT_SURFACE, looks.channel],
+      [THREAD_HISTORY_SURFACE, looks.thread],
+    ] as const
+  ).filter(([, look]) => look.kept.length > 0 || look.withheld.length > 0);
+  if (blocks.length === 0) return;
+  await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
+    for (const [surface, look] of blocks) {
+      await mailbox.insertMessage({
+        id: `${sessionId}:${surface}:${trigger.id}`,
+        kind: 'chat',
+        timestamp: trigger.timestamp,
+        platformId: null,
+        channelType: ECHO_CHANNEL_TYPE,
+        threadId: null,
+        content: blockContent(look, trigger.id, surface),
+        processAfter: null,
+        recurrence: null,
+        trigger: false,
+        sourceSessionId: null,
+        onWake: false,
+      });
+    }
+  });
+  log.debug('Wrote platform history', { sessionId, blocks: blocks.map(([surface]) => surface) });
+}
+
+/** A hot session has been hearing its conversation live (see backfill.ts). */
+async function isHot(agentGroupId: string, sessionId: string, mgId: string, now: number): Promise<boolean> {
+  const candidates = await loadHotCandidates(agentGroupId, mgId, now);
+  return selectHotSessions(candidates, mgId, now).some((s) => s.id === sessionId);
+}
+
+function linesOf(read: PromiseSettledResult<HistoryLine[]>, what: string, sessionId: string): HistoryLine[] {
+  if (read.status === 'fulfilled') return read.value;
+  log.warn(`Platform history: the ${what} read failed (continuing without it)`, { sessionId, err: read.reason });
+  return [];
 }
 
 export async function backfillPlatformHistory(
@@ -230,37 +272,65 @@ export async function backfillPlatformHistory(
   if (!PLATFORM_HISTORY_CHANNELS.has(mg.channel_type)) return;
   try {
     const threadId = session.thread_id;
-    if (threadId === null || isTaskThread(threadId)) return;
+    if (threadId !== null && isTaskThread(threadId)) return;
     const instance = mg.instance ?? mg.channel_type;
     const adapter = getChannelAdapterExact(instance);
     const readHistory = adapter?.readHistory?.bind(adapter);
     if (!readHistory) return;
-    const key = `${instance}\n${threadId}`;
+    const key = `${instance}\n${threadId ?? mg.platform_id}`;
     if (overdueReads.has(key)) return;
 
-    const look = (async (): Promise<Look> => {
+    const look = (async (): Promise<Looks> => {
       const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroup.id);
-      if (!wiring || (!options.created && takesEveryMessage(wiring))) return NOTHING;
-      const lines = await readHistory(mg.platform_id, threadId, { limit: THREAD_HISTORY_LIMIT });
+      if (!wiring) return NO_LOOKS;
+      const now = Date.now();
+      const thread = threadId !== null && (options.created || !takesEveryMessage(wiring)) ? threadId : null;
+      // The chat's top level, when the backfill would seed it too: a new or long-idle session.
+      const channel = options.created || !(await isHot(agentGroup.id, session.id, mg.id, now));
+      if (thread === null && !channel) return NO_LOOKS;
+      const [threadRead, channelRead] = await Promise.allSettled([
+        thread !== null ? readHistory(mg.platform_id, thread, { limit: THREAD_HISTORY_LIMIT }) : [],
+        channel ? readHistory(mg.platform_id, null, { limit: BACKFILL_LIMIT + 2 }) : [],
+      ]);
+      const threadLines = linesOf(threadRead, 'thread', session.id);
+      const channelLines = linesOf(channelRead, 'channel', session.id);
+      // After the platform reads, so whatever landed meanwhile counts as seen.
+      const { seen, written } = await readSeen(agentGroup.id, session.id, options.trigger.id);
       // A full window without the trigger is not the thread's newest lines
       // (a platform that pages from the oldest): showing it would mislead.
-      if (lines.length >= THREAD_HISTORY_LIMIT && !lines.some((line) => line.id === options.trigger.id)) {
-        log.warn('Platform history skipped: the read did not reach the newest lines', { sessionId: session.id });
-        return NOTHING;
-      }
-      // After the platform read, so whatever landed meanwhile counts as seen.
-      const { seen, hasBlock } = await readSeen(agentGroup.id, session.id, options.trigger.id);
-      return hasBlock ? NOTHING : unseenLines(lines, seen, options.trigger, mg, wiring);
+      const oldWindow =
+        threadLines.length >= THREAD_HISTORY_LIMIT && !threadLines.some((line) => line.id === options.trigger.id);
+      if (oldWindow)
+        log.warn('Platform history: the thread read did not reach its newest lines', { sessionId: session.id });
+      // The thread's own lines, its first among them, belong to the thread block.
+      const inThread = new Set(threadLines.map((line) => line.id));
+      const horizon = now - ECHO_MAX_AGE_MS;
+      return {
+        thread:
+          oldWindow || written.has(THREAD_HISTORY_SURFACE)
+            ? NOTHING
+            : await unseenLines(threadLines, seen, options.trigger, mg, wiring, THREAD_HISTORY_LIMIT),
+        channel: written.has(CHANNEL_CONTEXT_SURFACE)
+          ? NOTHING
+          : await unseenLines(
+              channelLines.filter((line) => !inThread.has(line.id) && Date.parse(line.timestamp) > horizon),
+              seen,
+              options.trigger,
+              mg,
+              wiring,
+              BACKFILL_LIMIT,
+            ),
+      };
     })();
     const found = await within(look, PLATFORM_HISTORY_BUDGET_MS);
     if (found === undefined) {
       log.warn('Platform history is slow; its block will follow the message', { sessionId: session.id });
-      const late = look.then((result) => writeBlock(agentGroup.id, session.id, options.trigger, result));
+      const late = look.then((result) => writeBlocks(agentGroup.id, session.id, options.trigger, result));
       late.catch((err: unknown) => log.warn('Platform history failed (continuing without it)', { err }));
       holdWhileRunning(key, late);
       return;
     }
-    await writeBlock(agentGroup.id, session.id, options.trigger, found);
+    await writeBlocks(agentGroup.id, session.id, options.trigger, found);
     // eslint-disable-next-line no-catch-all/no-catch-all -- context only: the trigger is written either way
   } catch (err) {
     log.warn('Platform history failed (continuing without it)', { sessionId: session.id, err });

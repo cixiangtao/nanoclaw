@@ -66,6 +66,8 @@ vi.mock('./config.js', async () => ({
 
 const readHistory =
   vi.fn<(platformId: string, threadId: string, options: { limit: number }) => Promise<HistoryLine[]>>();
+/** Reads of the chat's top level (threadId null). */
+const readChannel = vi.fn<(platformId: string, options: { limit: number }) => Promise<HistoryLine[]>>();
 
 const channelDefaults: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'public' },
@@ -83,7 +85,8 @@ function makeAdapter(): ChannelAdapter {
     teardown: async () => {},
     isConnected: () => true,
     deliver: async () => undefined,
-    readHistory: (platformId, threadId, options) => readHistory(platformId, threadId, options),
+    readHistory: (platformId, threadId, options) =>
+      threadId === null ? readChannel(platformId, options) : readHistory(platformId, threadId, options),
   };
 }
 
@@ -151,12 +154,12 @@ async function seed(
 async function send(
   id: string,
   minutes: number,
-  options: { threadId?: string; isMention?: boolean; platformId?: string; isGroup?: boolean } = {},
+  options: { threadId?: string | null; isMention?: boolean; platformId?: string; isGroup?: boolean } = {},
 ): Promise<void> {
   await routeInbound({
     channelType: 'testchat',
     platformId: options.platformId ?? 'testchat:C1',
-    threadId: options.threadId ?? THREAD,
+    threadId: options.threadId === undefined ? THREAD : options.threadId,
     message: {
       id,
       kind: 'chat-sdk',
@@ -192,8 +195,9 @@ async function rows(threadId = THREAD): Promise<Row[]> {
 
 function blocks(
   all: Row[],
+  surface = 'thread-history',
 ): Array<{ withheld: number; lines: Array<{ sender: string; text: string; self?: boolean }> }> {
-  return all.map((r) => JSON.parse(r.content)).filter((c) => c.echo?.surface === 'thread-history');
+  return all.map((r) => JSON.parse(r.content)).filter((c) => c.echo?.surface === surface);
 }
 
 beforeEach(async () => {
@@ -201,6 +205,8 @@ beforeEach(async () => {
   admission.hang = false;
   admission.release = [];
   readHistory.mockReset();
+  readChannel.mockReset();
+  readChannel.mockResolvedValue([]);
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await runMigrations(await initTestDb());
@@ -224,6 +230,7 @@ describe('thread history read from the platform', () => {
     await send('m2', 6);
 
     expect(readHistory).not.toHaveBeenCalled();
+    expect(readChannel).not.toHaveBeenCalled();
     expect((await rows()).map((r) => r.id)).toEqual(['m1:ag-1', 'm2:ag-1']);
   });
 
@@ -495,6 +502,108 @@ describe('thread history read from the platform', () => {
     });
 
     expect(blocks(await rows())).toHaveLength(1);
+  });
+
+  it("gives a new session the chat's other recent top-level lines as one row, before the thread's", async () => {
+    await seed();
+    const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
+    readChannel.mockResolvedValueOnce([
+      line('C0', 0, 'from four days ago', { timestamp: fourDaysAgo }),
+      line('R', 0.5, 'the deploy is red', { senderName: 'Lee', senderId: 'U3' }),
+      line('C1', 1, 'lunch at noon?'),
+      line('C2', 2, 'release notes are up', { senderName: 'Releases', senderId: 'B9', isBot: true, isSelf: true }),
+      line('C3', 6, 'posted after the tag'),
+    ]);
+    readHistory.mockResolvedValueOnce([
+      line('R', 0.5, 'the deploy is red', { senderName: 'Lee', senderId: 'U3' }),
+      line('L1', 3, 'still red after the retry'),
+      line('m1', 5, 'message m1', { senderId: 'U1' }),
+    ]);
+
+    await send('m1', 5);
+
+    expect(readChannel).toHaveBeenCalledWith('testchat:C1', { limit: 14 });
+    const all = await rows();
+    expect(all.map((r) => (JSON.parse(r.content).echo?.surface as string) ?? r.id)).toEqual([
+      'channel-context',
+      'thread-history',
+      'm1:ag-1',
+    ]);
+    expect(blocks(all, 'channel-context')[0].lines.map((l) => l.text)).toEqual([
+      'lunch at noon?',
+      'release notes are up',
+    ]);
+    expect(blocks(all)[0].lines.map((l) => l.text)).toEqual(['the deploy is red', 'still red after the retry']);
+  });
+
+  it('leaves out of the channel block what the backfill already seeded', async () => {
+    await seed();
+    // An earlier conversation in this channel: its opener S1, and the agent's top-level post P1.
+    await send('S1', 1, { threadId: 'testchat:C1:S1' });
+    const first = await sessionId('testchat:C1:S1');
+    const outbound = new Database(sessionMailboxPath({ agentGroupId: 'ag-1', sessionId: first }, 'outbound'));
+    outbound
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+         VALUES ('out-1', 1, ?, 'chat', 'testchat:C1', 'testchat', NULL, ?)`,
+      )
+      .run(at(2), JSON.stringify({ text: 'Standup moved to 10' }));
+    outbound.close();
+    const inbound = new Database(inboundDbPath('ag-1', first));
+    inbound
+      .prepare(
+        "INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES ('out-1', 'P1', 'delivered', ?)",
+      )
+      .run(at(2));
+    inbound.close();
+
+    readChannel.mockResolvedValueOnce([
+      line('S1', 1, 'message S1', { senderId: 'U1', senderName: 'Alex' }),
+      line('P1', 2, 'Standup moved to 10', { senderName: 'Pip', isBot: true, isSelf: true }),
+      line('C5', 3, 'who has the release?'),
+    ]);
+    readHistory.mockResolvedValueOnce([line('m9', 4, 'message m9', { senderId: 'U1' })]);
+    await send('m9', 4, { threadId: 'testchat:C1:900' });
+
+    const all = await rows('testchat:C1:900');
+    expect(all.filter((r) => r.content.includes('Standup moved to 10'))).toHaveLength(1);
+    expect(blocks(all, 'channel-context')[0].lines.map((l) => l.text)).toEqual(['who has the release?']);
+  });
+
+  it('reads no channel lines for a session that hears its chat live', async () => {
+    await seed();
+    readHistory.mockResolvedValue([]);
+    await send('m1', 5);
+    await send('m2', 6); // same thread, session now active: the thread is read, the chat is not
+
+    expect(readChannel).toHaveBeenCalledTimes(1);
+    expect(readHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it("gives a session at the chat's top level the chat's lines, with no thread read", async () => {
+    await seed();
+    readChannel.mockResolvedValueOnce([line('C1', 1, 'is anyone on call?'), line('m1', 5, 'message m1')]);
+
+    await send('m1', 5, { threadId: null });
+
+    expect(readHistory).not.toHaveBeenCalled();
+    const session = (await findSessionForAgent('ag-1', 'mg-1', null))!;
+    const db = new Database(inboundDbPath('ag-1', session.id), { readonly: true });
+    const found = db.prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{ content: string }>;
+    db.close();
+    expect(JSON.parse(found[0].content).lines.map((l: { text: string }) => l.text)).toEqual(['is anyone on call?']);
+  });
+
+  it('keeps the thread block when the channel read fails', async () => {
+    await seed();
+    readChannel.mockRejectedValueOnce(new Error('no top-level reads here'));
+    readHistory.mockResolvedValueOnce([line('L1', 1, 'earlier'), line('m1', 5, 'message m1', { senderId: 'U1' })]);
+
+    await send('m1', 5);
+
+    const all = await rows();
+    expect(blocks(all, 'channel-context')).toHaveLength(0);
+    expect(blocks(all)[0].lines.map((l) => l.text)).toEqual(['earlier']);
   });
 
   it("shows the agent's own top-level post once when a reply in its thread opens a new session", async () => {
