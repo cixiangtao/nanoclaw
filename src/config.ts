@@ -58,9 +58,9 @@ export const FAST_MODE = ['1', 'true'].includes(
   (process.env.NANOCLAW_FAST_MODE || envConfig.NANOCLAW_FAST_MODE || '').toLowerCase(),
 );
 
-// Channel types (e.g. 'slack') whose threads are read back from the platform
-// when an agent is tagged there, so it sees what was said without it.
-// Comma-separated; unset or empty is off.
+// Channel types (e.g. 'slack') whose threads and top-level talk are read back
+// from the platform when an agent is tagged there, so it sees what was said
+// without it. Comma-separated; unset or empty is off.
 export const PLATFORM_HISTORY_CHANNELS: ReadonlySet<string> = new Set(
   (process.env.NANOCLAW_PLATFORM_HISTORY || envConfig.NANOCLAW_PLATFORM_HISTORY || '')
     .split(',')

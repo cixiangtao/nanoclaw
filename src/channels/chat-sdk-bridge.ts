@@ -1359,6 +1359,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         text: m.text,
         isBot: m.author.isBot === true,
         isSelf: m.author.isMe,
+        threadId: m.threadId,
       }));
     },
   };

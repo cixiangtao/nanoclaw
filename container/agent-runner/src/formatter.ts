@@ -296,7 +296,7 @@ function formatEchoMessage(msg: MessageInRow): string {
     });
     const withheld = Number(content.withheld) || 0;
     if (withheld > 0) {
-      lines.push(`${withheld} earlier ${withheld === 1 ? 'line' : 'lines'} from senders not admitted in this chat left out.`);
+      lines.push(`${withheld} ${withheld === 1 ? 'line' : 'lines'} from senders not admitted in this chat left out.`);
     }
     return `<${block}>\n${lines.join('\n')}\n</${block}>`;
   }

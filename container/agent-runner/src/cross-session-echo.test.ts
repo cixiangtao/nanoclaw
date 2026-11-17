@@ -186,7 +186,7 @@ describe('formatter rendering', () => {
     );
 
     expect(formatMessages(getPendingMessages())).toContain(
-      '<thread-history>\n2 earlier lines from senders not admitted in this chat left out.\n</thread-history>',
+      '<thread-history>\n2 lines from senders not admitted in this chat left out.\n</thread-history>',
     );
   });
 

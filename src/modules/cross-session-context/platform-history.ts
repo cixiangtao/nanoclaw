@@ -31,8 +31,10 @@ import { wouldAdmitSender } from '../permissions/access.js';
 import { BACKFILL_LIMIT } from './backfill.js';
 import {
   CHANNEL_CONTEXT_SURFACE,
+  ECHO_CHANNEL_TIMELINE_SURFACE,
   ECHO_CHANNEL_TYPE,
   ECHO_MAX_AGE_MS,
+  ECHO_TIMELINE_SURFACE,
   PLATFORM_HISTORY_BUDGET_MS,
   THREAD_HISTORY_LIMIT,
   THREAD_HISTORY_SURFACE,
@@ -80,19 +82,6 @@ function takesEveryMessage(wiring: MessagingGroupAgent): boolean {
     wiring.engage_mode === 'mention-sticky' ||
     (wiring.engage_mode === 'pattern' && (wiring.engage_pattern ?? '.') === '.')
   );
-}
-
-/** Resolves undefined when `work` has not settled within `ms`. */
-async function within<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), ms);
-  });
-  try {
-    return await Promise.race([work, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 interface BlockContent {
@@ -257,10 +246,26 @@ async function isHot(agentGroupId: string, sessionId: string, mgId: string, now:
   return selectHotSessions(candidates, mgId, now).some((s) => s.id === sessionId);
 }
 
-function linesOf(read: PromiseSettledResult<HistoryLine[]>, what: string, sessionId: string): HistoryLine[] {
-  if (read.status === 'fulfilled') return read.value;
-  log.warn(`Platform history: the ${what} read failed (continuing without it)`, { sessionId, err: read.reason });
-  return [];
+/**
+ * When the newest row the session already had arrived, ignoring the rows the
+ * backfill seeded this wake (the backfill's own catch-up floor).
+ */
+async function newestKnownRow(agentGroupId: string, sessionId: string): Promise<number | undefined> {
+  const rows = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+    mailbox.getInboundHistory(BACKFILL_LIMIT + 1),
+  );
+  for (const row of rows ?? []) {
+    let surface: unknown;
+    try {
+      surface = (JSON.parse(row.content) as { echo?: { surface?: unknown } }).echo?.surface;
+      // eslint-disable-next-line no-catch-all/no-catch-all -- a row that is not JSON is still a row the session has
+    } catch {
+      surface = undefined;
+    }
+    if (surface !== ECHO_TIMELINE_SURFACE && surface !== ECHO_CHANNEL_TIMELINE_SURFACE)
+      return Date.parse(row.timestamp);
+  }
+  return undefined;
 }
 
 export async function backfillPlatformHistory(
@@ -280,57 +285,83 @@ export async function backfillPlatformHistory(
     const key = `${instance}\n${threadId ?? mg.platform_id}`;
     if (overdueReads.has(key)) return;
 
-    const look = (async (): Promise<Looks> => {
-      const wiring = await getMessagingGroupAgentByPair(mg.id, agentGroup.id);
-      if (!wiring) return NO_LOOKS;
-      const now = Date.now();
-      const thread = threadId !== null && (options.created || !takesEveryMessage(wiring)) ? threadId : null;
-      // The chat's top level, when the backfill would seed it too: a new or long-idle session.
-      const channel = options.created || !(await isHot(agentGroup.id, session.id, mg.id, now));
-      if (thread === null && !channel) return NO_LOOKS;
-      const [threadRead, channelRead] = await Promise.allSettled([
-        thread !== null ? readHistory(mg.platform_id, thread, { limit: THREAD_HISTORY_LIMIT }) : [],
-        channel ? readHistory(mg.platform_id, null, { limit: BACKFILL_LIMIT + 2 }) : [],
-      ]);
-      const threadLines = linesOf(threadRead, 'thread', session.id);
-      const channelLines = linesOf(channelRead, 'channel', session.id);
-      // After the platform reads, so whatever landed meanwhile counts as seen.
-      const { seen, written } = await readSeen(agentGroup.id, session.id, options.trigger.id);
+    const wiring = getMessagingGroupAgentByPair(mg.id, agentGroup.id);
+    // Read now, before anything is written this wake: the backfill's catch-up
+    // floor. Unreadable: assume the session has everything.
+    const knownUntil = options.created ? undefined : newestKnownRow(agentGroup.id, session.id).catch(() => Date.now());
+    const giveUp = (what: string) => (err: unknown) => {
+      log.warn(`Platform history: the ${what} look failed (continuing without it)`, { sessionId: session.id, err });
+      return NOTHING;
+    };
+
+    const threadLook = (async (): Promise<Look> => {
+      const w = await wiring;
+      if (threadId === null || !w || (!options.created && takesEveryMessage(w))) return NOTHING;
+      const lines = await readHistory(mg.platform_id, threadId, { limit: THREAD_HISTORY_LIMIT });
       // A full window without the trigger is not the thread's newest lines
       // (a platform that pages from the oldest): showing it would mislead.
-      const oldWindow =
-        threadLines.length >= THREAD_HISTORY_LIMIT && !threadLines.some((line) => line.id === options.trigger.id);
-      if (oldWindow)
+      if (lines.length >= THREAD_HISTORY_LIMIT && !lines.some((line) => line.id === options.trigger.id)) {
         log.warn('Platform history: the thread read did not reach its newest lines', { sessionId: session.id });
-      // The thread's own lines, its first among them, belong to the thread block.
-      const inThread = new Set(threadLines.map((line) => line.id));
-      const horizon = now - ECHO_MAX_AGE_MS;
-      return {
-        thread:
-          oldWindow || written.has(THREAD_HISTORY_SURFACE)
-            ? NOTHING
-            : await unseenLines(threadLines, seen, options.trigger, mg, wiring, THREAD_HISTORY_LIMIT),
-        channel: written.has(CHANNEL_CONTEXT_SURFACE)
-          ? NOTHING
-          : await unseenLines(
-              channelLines.filter((line) => !inThread.has(line.id) && Date.parse(line.timestamp) > horizon),
-              seen,
-              options.trigger,
-              mg,
-              wiring,
-              BACKFILL_LIMIT,
-            ),
-      };
-    })();
-    const found = await within(look, PLATFORM_HISTORY_BUDGET_MS);
-    if (found === undefined) {
+        return NOTHING;
+      }
+      // After the platform read, so whatever landed meanwhile counts as seen.
+      const { seen, written } = await readSeen(agentGroup.id, session.id, options.trigger.id);
+      if (written.has(THREAD_HISTORY_SURFACE)) return NOTHING;
+      return unseenLines(lines, seen, options.trigger, mg, w, THREAD_HISTORY_LIMIT);
+    })().catch(giveUp('thread'));
+
+    // The chat's top level, when the backfill seeds too (a new or long-idle
+    // session), over the same window: newer than what the session already
+    // has, within the backfill's horizon.
+    const channelLook = (async (): Promise<Look> => {
+      const w = await wiring;
+      const now = Date.now();
+      // A session shared across chats would carry this chat's unaddressed talk into the others.
+      if (!w || w.session_mode === 'agent-shared') return NOTHING;
+      if (!options.created && (await isHot(agentGroup.id, session.id, mg.id, now))) return NOTHING;
+      const lines = await readHistory(mg.platform_id, null, { limit: BACKFILL_LIMIT + 2 });
+      const floor = Math.max(now - ECHO_MAX_AGE_MS, (await knownUntil) ?? Number.NEGATIVE_INFINITY);
+      const { seen, written } = await readSeen(agentGroup.id, session.id, options.trigger.id);
+      if (written.has(CHANNEL_CONTEXT_SURFACE)) return NOTHING;
+      const recent = lines.filter(
+        // This thread's opener belongs to the thread block.
+        (line) => Date.parse(line.timestamp) > floor && (threadId === null || line.threadId !== threadId),
+      );
+      return unseenLines(recent, seen, options.trigger, mg, w, BACKFILL_LIMIT);
+    })().catch(giveUp('channel'));
+
+    // One budget for both: each block that is ready by then goes before the
+    // message, and one that is not follows when it lands.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), PLATFORM_HISTORY_BUDGET_MS);
+    });
+    const [thread, channel] = await Promise.all([
+      Promise.race([threadLook, deadline]),
+      Promise.race([channelLook, deadline]),
+    ]);
+    clearTimeout(timer);
+    await writeBlocks(agentGroup.id, session.id, options.trigger, {
+      thread: thread ?? NOTHING,
+      channel: channel ?? NOTHING,
+    });
+
+    const late = [
+      thread === undefined &&
+        threadLook.then((look) =>
+          writeBlocks(agentGroup.id, session.id, options.trigger, { ...NO_LOOKS, thread: look }),
+        ),
+      channel === undefined &&
+        channelLook.then((look) =>
+          writeBlocks(agentGroup.id, session.id, options.trigger, { ...NO_LOOKS, channel: look }),
+        ),
+    ].filter((work): work is Promise<void> => work !== false);
+    if (late.length > 0) {
       log.warn('Platform history is slow; its block will follow the message', { sessionId: session.id });
-      const late = look.then((result) => writeBlocks(agentGroup.id, session.id, options.trigger, result));
-      late.catch((err: unknown) => log.warn('Platform history failed (continuing without it)', { err }));
-      holdWhileRunning(key, late);
-      return;
+      const settled = Promise.all(late);
+      settled.catch((err: unknown) => log.warn('Platform history failed (continuing without it)', { err }));
+      holdWhileRunning(key, settled);
     }
-    await writeBlocks(agentGroup.id, session.id, options.trigger, found);
     // eslint-disable-next-line no-catch-all/no-catch-all -- context only: the trigger is written either way
   } catch (err) {
     log.warn('Platform history failed (continuing without it)', { sessionId: session.id, err });

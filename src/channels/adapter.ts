@@ -147,6 +147,8 @@ export interface HistoryLine {
   isBot: boolean;
   /** Written by this adapter's own bot user. */
   isSelf: boolean;
+  /** The thread the line belongs to, when the platform says; a thread's opener carries its own thread's id. */
+  threadId?: string;
 }
 
 /** Wiring/mg defaults for one conversation context (DM vs group/channel). */

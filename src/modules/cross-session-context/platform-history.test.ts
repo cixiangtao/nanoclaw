@@ -509,7 +509,7 @@ describe('thread history read from the platform', () => {
     const fourDaysAgo = new Date(Date.now() - 4 * 24 * 60 * 60 * 1000).toISOString();
     readChannel.mockResolvedValueOnce([
       line('C0', 0, 'from four days ago', { timestamp: fourDaysAgo }),
-      line('R', 0.5, 'the deploy is red', { senderName: 'Lee', senderId: 'U3' }),
+      line('R', 0.5, 'the deploy is red', { senderName: 'Lee', senderId: 'U3', threadId: THREAD }),
       line('C1', 1, 'lunch at noon?'),
       line('C2', 2, 'release notes are up', { senderName: 'Releases', senderId: 'B9', isBot: true, isSelf: true }),
       line('C3', 6, 'posted after the tag'),
@@ -592,6 +592,115 @@ describe('thread history read from the platform', () => {
     const found = db.prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{ content: string }>;
     db.close();
     expect(JSON.parse(found[0].content).lines.map((l: { text: string }) => l.text)).toEqual(['is anyone on call?']);
+  });
+
+  it('does not hold a ready thread block for a slow channel read', async () => {
+    await seed();
+    let finish: (lines: HistoryLine[]) => void = () => {};
+    readChannel.mockReturnValueOnce(new Promise<HistoryLine[]>((resolve) => (finish = resolve)));
+    readHistory.mockResolvedValueOnce([line('L1', 1, 'earlier'), line('m1', 5, 'message m1', { senderId: 'U1' })]);
+
+    await send('m1', 5);
+    expect((await rows()).map((r) => JSON.parse(r.content).echo?.surface ?? r.id)).toEqual([
+      'thread-history',
+      'm1:ag-1',
+    ]);
+
+    finish([line('C1', 2, 'standup moved')]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(blocks(await rows(), 'channel-context')[0].lines.map((l) => l.text)).toEqual(['standup moved']);
+  });
+
+  it("leaves out this thread's opener when the thread read did not reach it", async () => {
+    await seed();
+    const replies = Array.from({ length: 99 }, (_, i) => line(`r${i}`, 1 + i / 100, `reply ${i}`));
+    readHistory.mockResolvedValueOnce([...replies, line('m1', 5, 'message m1', { senderId: 'U1' })]);
+    readChannel.mockResolvedValueOnce([
+      line('R', 0.5, 'the opener', { threadId: THREAD }),
+      line('C1', 0.7, 'unrelated top-level talk'),
+    ]);
+
+    await send('m1', 5);
+
+    expect(blocks(await rows(), 'channel-context')[0].lines.map((l) => l.text)).toEqual(['unrelated top-level talk']);
+  });
+
+  it('on a cold catch-up, shows no channel line the session already got while it was active', async () => {
+    await seed();
+    await send('a1', 1, { threadId: 'testchat:C1:A' }); // thread A, active
+    await send('S1', 2, { threadId: 'testchat:C1:S1' }); // opens thread S1; A hears it live
+    await settleEchoFans();
+    // Nine newer conversations push A out of the ones that hear the chat live.
+    for (let i = 0; i < 9; i++) {
+      await send(`n${i}`, 3 + i / 10, { threadId: `testchat:C1:n${i}` });
+      await settleEchoFans();
+    }
+    readChannel.mockResolvedValueOnce([
+      line('S1', 2, 'message S1', { senderId: 'U1', senderName: 'Alex' }),
+      line('C9', 20, 'said after everything A heard'),
+    ]);
+    readHistory.mockResolvedValue([]);
+
+    await send('a2', 30, { threadId: 'testchat:C1:A' });
+
+    const all = await rows('testchat:C1:A');
+    expect(blocks(all, 'channel-context')[0].lines.map((l) => l.text)).toEqual(['said after everything A heard']);
+    expect(all.filter((r) => r.content.includes('message S1'))).toHaveLength(1);
+  });
+
+  it('caps the channel block at 12 lines and counts a left-out sender there too', async () => {
+    await seed({ unknownSenderPolicy: 'strict' });
+    await upsertUser({ id: 'testchat:U2', kind: 'testchat', display_name: 'Dana', created_at: at(0) });
+    await addMember({ user_id: 'testchat:U2', agent_group_id: 'ag-1', added_by: null, added_at: at(0) });
+    readChannel.mockResolvedValueOnce([
+      line('X1', 0.5, 'from a stranger', { senderId: 'U9' }),
+      ...Array.from({ length: 13 }, (_, i) => line(`C${i}`, 1 + i / 10, `top-level ${i}`)),
+    ]);
+    readHistory.mockResolvedValueOnce([line('m1', 5, 'message m1', { senderId: 'U1' })]);
+
+    await send('m1', 5);
+
+    const [block] = blocks(await rows(), 'channel-context');
+    expect(block.lines.map((l) => l.text)).toEqual(Array.from({ length: 12 }, (_, i) => `top-level ${i + 1}`));
+    expect(block.withheld).toBe(1);
+  });
+
+  it('reads no channel lines into a session shared across chats', async () => {
+    await createAgentGroup({ id: 'ag-1', name: 'Pip', folder: 'pip', agent_provider: null, created_at: at(0) });
+    await createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'testchat',
+      platform_id: 'testchat:C1',
+      instance: 'testchat',
+      name: 'Team room',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: at(0),
+    });
+    await createMessagingGroupAgent({
+      id: 'mga-1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      threads: 0,
+      created_at: at(0),
+    });
+    registerChannelAdapter('testchat', { factory: () => makeAdapter(), defaults: channelDefaults });
+    await initChannelAdapters(() => ({
+      onInbound: () => {},
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    await send('m1', 5, { threadId: null });
+
+    expect(readChannel).not.toHaveBeenCalled();
   });
 
   it('keeps the thread block when the channel read fails', async () => {
