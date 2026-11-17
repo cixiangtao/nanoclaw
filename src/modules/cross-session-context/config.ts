@@ -74,3 +74,7 @@ export const PLATFORM_HISTORY_BUDGET_MS = 1500;
 /** Platform history: other recent top-level talk in the chat, read back from
  *  the chat for a new or long-idle session. Rendered as <channel-context>. */
 export const CHANNEL_CONTEXT_SURFACE = 'channel-context';
+
+/** Top-level lines read for the channel block: room for the ones already
+ *  seen, refused or from this thread, so up to BACKFILL_LIMIT can remain. */
+export const CHANNEL_READ_WINDOW = 30;

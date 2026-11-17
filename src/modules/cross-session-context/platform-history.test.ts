@@ -522,7 +522,7 @@ describe('thread history read from the platform', () => {
 
     await send('m1', 5);
 
-    expect(readChannel).toHaveBeenCalledWith('testchat:C1', { limit: 14 });
+    expect(readChannel).toHaveBeenCalledWith('testchat:C1', { limit: 30 });
     const all = await rows();
     expect(all.map((r) => (JSON.parse(r.content).echo?.surface as string) ?? r.id)).toEqual([
       'channel-context',
@@ -663,6 +663,25 @@ describe('thread history read from the platform', () => {
     const [block] = blocks(await rows(), 'channel-context');
     expect(block.lines.map((l) => l.text)).toEqual(Array.from({ length: 12 }, (_, i) => `top-level ${i + 1}`));
     expect(block.withheld).toBe(1);
+  });
+
+  it('reads a window wide enough that 12 lines remain after refused senders, and counts them', async () => {
+    await seed({ unknownSenderPolicy: 'strict' });
+    await upsertUser({ id: 'testchat:U2', kind: 'testchat', display_name: 'Dana', created_at: at(0) });
+    await addMember({ user_id: 'testchat:U2', agent_group_id: 'ag-1', added_by: null, added_at: at(0) });
+    const topLevel = [
+      ...Array.from({ length: 17 }, (_, i) => line(`C${i}`, 1 + i / 10, `top-level ${i}`)),
+      ...Array.from({ length: 3 }, (_, i) => line(`X${i}`, 3 + i / 10, `stranger ${i}`, { senderId: `U9${i}` })),
+    ];
+    // The platform returns the newest `limit` lines.
+    readChannel.mockImplementationOnce(async (_platformId, { limit }) => topLevel.slice(-limit));
+    readHistory.mockResolvedValueOnce([line('m1', 5, 'message m1', { senderId: 'U1' })]);
+
+    await send('m1', 5);
+
+    const [block] = blocks(await rows(), 'channel-context');
+    expect(block.lines.map((l) => l.text)).toEqual(Array.from({ length: 12 }, (_, i) => `top-level ${i + 5}`));
+    expect(block.withheld).toBe(3);
   });
 
   it('reads no channel lines into a session shared across chats', async () => {

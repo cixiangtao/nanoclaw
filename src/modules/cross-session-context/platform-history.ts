@@ -31,6 +31,7 @@ import { wouldAdmitSender } from '../permissions/access.js';
 import { BACKFILL_LIMIT } from './backfill.js';
 import {
   CHANNEL_CONTEXT_SURFACE,
+  CHANNEL_READ_WINDOW,
   ECHO_CHANNEL_TIMELINE_SURFACE,
   ECHO_CHANNEL_TYPE,
   ECHO_MAX_AGE_MS,
@@ -319,7 +320,7 @@ export async function backfillPlatformHistory(
       // A session shared across chats would carry this chat's unaddressed talk into the others.
       if (!w || w.session_mode === 'agent-shared') return NOTHING;
       if (!options.created && (await isHot(agentGroup.id, session.id, mg.id, now))) return NOTHING;
-      const lines = await readHistory(mg.platform_id, null, { limit: BACKFILL_LIMIT + 2 });
+      const lines = await readHistory(mg.platform_id, null, { limit: CHANNEL_READ_WINDOW });
       const floor = Math.max(now - ECHO_MAX_AGE_MS, (await knownUntil) ?? Number.NEGATIVE_INFINITY);
       const { seen, written } = await readSeen(agentGroup.id, session.id, options.trigger.id);
       if (written.has(CHANNEL_CONTEXT_SURFACE)) return NOTHING;
